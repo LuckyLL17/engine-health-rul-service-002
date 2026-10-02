@@ -112,3 +112,50 @@ export type ModelVersion = {
   weights: { temperature: number; fuel: number; vibration: number; oil: number; degradation: number };
   calibratedAt: string;
 };
+
+export type MaintenancePlanExclusionReason = 'missing_assessment' | 'missing_prediction' | 'stale_data' | 'component_mismatch' | 'capacity_exceeded';
+
+export type MaintenancePlanSlot = {
+  rank: number;
+  engineId: string;
+  healthScore: number;
+  status: EngineStatus;
+  lowerBound: number;
+  estimatedRemainingCycles: number;
+  limitingComponent: Component;
+  matchedComponent: Component;
+  assessmentId: string;
+  predictionId: string;
+  priorityScore: number;
+  reasons: string[];
+};
+
+export type MaintenancePlanExclusion = {
+  engineId: string;
+  reason: MaintenancePlanExclusionReason;
+  detail: string;
+};
+
+export type MaintenancePlanRequest = {
+  requestId?: string;
+  capacity: number;
+  components?: Component[];
+  maxDataAgeDays?: number;
+  createdBy?: string;
+};
+
+export type MaintenancePlan = {
+  id: string;
+  requestId: string;
+  createdAt: string;
+  createdBy: string;
+  capacity: number;
+  components: Component[];
+  maxDataAgeDays: number;
+  slots: MaintenancePlanSlot[];
+  excluded: MaintenancePlanExclusion[];
+  inputFingerprint: string;
+  explanation: string[];
+};
+
+export type MaintenancePlanView = MaintenancePlan & { status: 'active' | 'stale'; staleReasons: string[] };

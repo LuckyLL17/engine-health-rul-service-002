@@ -1,8 +1,9 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import { buildMaintenancePlan, fingerprintDiff, fleetFingerprint } from './allocation.js';
 import { assessEngine, maintenanceWindows, predictRul, validateTelemetry } from './health.js';
 import { LocalStore } from './store.js';
-import { Engine, HealthAssessment, MaintenanceEvent, ModelVersion, RulPrediction, TelemetrySample } from './types.js';
+import { Engine, HealthAssessment, MaintenanceEvent, MaintenancePlan, MaintenancePlanRequest, MaintenancePlanView, ModelVersion, RulPrediction, TelemetrySample } from './types.js';
 
 export async function createApp(store = new LocalStore()) {
   await store.init();
@@ -14,6 +15,7 @@ export async function createApp(store = new LocalStore()) {
   const requirePrediction = (id: string): RulPrediction => { const prediction = store.predictions.find(item => item.engineId === id); if (!prediction) throw Object.assign(new Error('rul_prediction_required'), { statusCode: 422 }); return prediction; };
   const findModel = (id?: string): ModelVersion => store.models.find(item => item.id === id) ?? store.models[store.models.length - 1];
   const fail = (message: string, statusCode = 404): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
+  const decoratePlan = (plan: MaintenancePlan): MaintenancePlanView => { const staleReasons = fingerprintDiff(plan.inputFingerprint, fleetFingerprint({ engines: store.engines, assessments: store.assessments, predictions: store.predictions, maintenance: store.maintenance })); return { ...plan, status: staleReasons.length ? 'stale' : 'active', staleReasons }; };
 
   app.get('/api/health', async () => ({ status: 'ok', service: 'engine-health-rul-service', storage: 'local-json', version: '0.1.0' }));
   app.get('/api/models', async () => store.models);
@@ -27,6 +29,9 @@ export async function createApp(store = new LocalStore()) {
   app.post('/api/engines/:id/maintenance-simulation', async request => { const id = (request.params as { id: string }).id; requireEngine(id); const prediction = requirePrediction(id); const body = (request.body ?? {}) as { delayCycles?: number }; const delay = Math.max(0, body.delayCycles ?? 0); return { engineId: id, delayCycles: delay, windows: maintenanceWindows({ ...prediction, estimatedRemainingCycles: prediction.estimatedRemainingCycles - delay, lowerBound: Math.max(1, prediction.lowerBound - delay), upperBound: Math.max(1, prediction.upperBound - delay) }), impact: { additionalRisk: Math.min(100, Math.round(delay / Math.max(prediction.estimatedRemainingCycles, 1) * 100)), recommendation: delay > prediction.lowerBound ? '延后超过寿命下界，不建议执行' : '当前延后仍在可评估范围内' } }; });
   app.post('/api/models/compare', async request => { const body = request.body as { engineId: string; modelIds?: string[] }; const engine = requireEngine(body.engineId); const rows = store.telemetry.filter(item => item.engineId === body.engineId); return (body.modelIds ?? store.models.map(item => item.id)).map(id => { const model = findModel(id); const result = assessEngine(engine, rows, model, store.maintenance.filter(item => item.engineId === engine.id).length); return { modelId: model.id, label: model.label, healthScore: result.healthScore, status: result.status, dataQuality: result.dataQuality.score, degradationSlope: result.indicators.degradationSlope }; }); });
   app.post('/api/maintenance-events', async request => { const event = request.body as MaintenanceEvent; requireEngine(event.engineId); store.addMaintenance(event); store.log('maintenance_event', event.engineId, { eventId: event.id, component: event.component }); await store.persist(); return event; });
+  app.post('/api/maintenance-plans', async request => { const body = (request.body ?? {}) as MaintenancePlanRequest; const capacity = Number(body.capacity); if (!Number.isInteger(capacity) || capacity < 1) fail('capacity must be a positive integer', 400); const requestId = body.requestId?.trim() || `REQ-${Date.now()}`; const existing = store.plans.find(item => item.requestId === requestId); if (existing) return decoratePlan(existing); const plan = buildMaintenancePlan({ id: `PLAN-${String(store.plans.length + 1).padStart(4, '0')}`, requestId, createdBy: body.createdBy ?? 'maintenance-coordinator', capacity, components: body.components, maxDataAgeDays: body.maxDataAgeDays, engines: store.engines, assessments: store.assessments, predictions: store.predictions, maintenance: store.maintenance }); store.addPlan(plan); store.log('maintenance_plan_created', 'fleet', { planId: plan.id, requestId, slots: plan.slots.length, excluded: plan.excluded.length }); await store.persist(); return decoratePlan(plan); });
+  app.get('/api/maintenance-plans', async () => store.plans.map(decoratePlan));
+  app.get('/api/maintenance-plans/:id', async request => { const plan = store.plans.find(item => item.id === (request.params as { id: string }).id) ?? fail('maintenance_plan_not_found', 404); return decoratePlan(plan); });
   app.get('/api/engines/:id/risk-events', async request => { const id = (request.params as { id: string }).id; return store.assessments.filter(item => item.engineId === id).flatMap(item => item.anomalies); });
   app.get('/api/audit/:engineId', async request => store.audit.filter(item => item.engineId === (request.params as { engineId: string }).engineId));
   app.setErrorHandler((error: Error, _request, reply) => reply.code((error as Error & { statusCode?: number }).statusCode ?? 500).send({ error: error.message }));

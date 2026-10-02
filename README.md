@@ -20,6 +20,7 @@
 - 维护窗口推演
 - 模型版本比较
 - 告警事件、审计轨迹和本地结果导出
+- 维护资源分配：跨发动机按风险、寿命下界、部件匹配和名额约束生成可追溯排程方案，支持幂等提交与过期识别
 
 ## 运行
 
@@ -49,7 +50,12 @@ POST /api/engines/:id/maintenance-simulation
 POST /api/models/compare
 GET  /api/engines/:id/risk-events
 GET  /api/audit/:engineId
+POST /api/maintenance-plans
+GET  /api/maintenance-plans
+GET  /api/maintenance-plans/:id
 ```
+
+`POST /api/maintenance-plans` 请求体：`capacity`（名额，必填）、`requestId`（幂等键，重复提交返回原方案）、`components`（本次可检修部件，缺省为全部）、`maxDataAgeDays`（评估/预测有效期，默认 30 天）、`createdBy`。响应中 `slots` 为入选排程（含排序理由与评估/预测溯源），`excluded` 列出缺少评估、缺少预测、数据过期、部件不匹配或名额不足的发动机；`status` 在发动机重新评估、重新预测或新增维护事件后自动变为 `stale` 并给出原因。
 
 ## 示例
 
