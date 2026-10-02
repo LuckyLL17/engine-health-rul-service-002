@@ -1,8 +1,9 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { assessEngine, maintenanceWindows, predictRul, validateTelemetry } from './health.js';
+import { buildAllocationPlan, withComputedStatus } from './allocation.js';
 import { LocalStore } from './store.js';
-import { Engine, HealthAssessment, MaintenanceEvent, ModelVersion, RulPrediction, TelemetrySample } from './types.js';
+import { AllocationRequest, Engine, HealthAssessment, MaintenanceEvent, ModelVersion, RulPrediction, TelemetrySample } from './types.js';
 
 export async function createApp(store = new LocalStore()) {
   await store.init();
@@ -27,6 +28,28 @@ export async function createApp(store = new LocalStore()) {
   app.post('/api/engines/:id/maintenance-simulation', async request => { const id = (request.params as { id: string }).id; requireEngine(id); const prediction = requirePrediction(id); const body = (request.body ?? {}) as { delayCycles?: number }; const delay = Math.max(0, body.delayCycles ?? 0); return { engineId: id, delayCycles: delay, windows: maintenanceWindows({ ...prediction, estimatedRemainingCycles: prediction.estimatedRemainingCycles - delay, lowerBound: Math.max(1, prediction.lowerBound - delay), upperBound: Math.max(1, prediction.upperBound - delay) }), impact: { additionalRisk: Math.min(100, Math.round(delay / Math.max(prediction.estimatedRemainingCycles, 1) * 100)), recommendation: delay > prediction.lowerBound ? '延后超过寿命下界，不建议执行' : '当前延后仍在可评估范围内' } }; });
   app.post('/api/models/compare', async request => { const body = request.body as { engineId: string; modelIds?: string[] }; const engine = requireEngine(body.engineId); const rows = store.telemetry.filter(item => item.engineId === body.engineId); return (body.modelIds ?? store.models.map(item => item.id)).map(id => { const model = findModel(id); const result = assessEngine(engine, rows, model, store.maintenance.filter(item => item.engineId === engine.id).length); return { modelId: model.id, label: model.label, healthScore: result.healthScore, status: result.status, dataQuality: result.dataQuality.score, degradationSlope: result.indicators.degradationSlope }; }); });
   app.post('/api/maintenance-events', async request => { const event = request.body as MaintenanceEvent; requireEngine(event.engineId); store.addMaintenance(event); store.log('maintenance_event', event.engineId, { eventId: event.id, component: event.component }); await store.persist(); return event; });
+  app.get('/api/maintenance-allocation/plans', async () => store.allocationPlans.map(plan => withComputedStatus(plan, store)));
+  app.get('/api/maintenance-allocation/plans/:planId', async (request, reply) => { const planId = (request.params as { planId: string }).planId; const plan = store.findPlanById(planId); if (!plan) return reply.code(404).send({ error: 'allocation_plan_not_found' }); return withComputedStatus(plan, store); });
+  app.post('/api/maintenance-allocation/plans', async (request, reply) => {
+    const body = (request.body ?? {}) as AllocationRequest;
+    const weights = [body.riskWeight, body.urgencyWeight].filter(value => value !== undefined);
+    if (weights.some(value => typeof value !== 'number' || value < 0 || value > 1)) fail('riskWeight/urgencyWeight 必须在 0 到 1 之间', 400);
+    if (body.totalQuota !== undefined && (!Number.isFinite(body.totalQuota) || body.totalQuota < 1)) fail('totalQuota 必须为不小于 1 的整数', 400);
+    for (const slot of body.slots ?? []) { if (!slot?.slotId || !Number.isFinite(slot.totalCapacity) || slot.totalCapacity < 1) fail('每个名额窗口需要 slotId 与不小于 1 的 totalCapacity', 400); }
+    for (const engineId of body.engineIds ?? []) if (!findEngine(engineId)) fail(`engine 不存在: ${engineId}`, 400);
+
+    // 重复提交（同一 clientRequestId）直接返回原方案，不能产生重复排程
+    if (body.clientRequestId) {
+      const existing = store.findPlanByRequestId(body.clientRequestId);
+      if (existing) return reply.send({ reused: true, plan: withComputedStatus(existing, store) });
+    }
+    const planId = `PLAN-${String(store.allocationPlans.length + 1).padStart(4, '0')}`;
+    const plan = buildAllocationPlan({ engines: store.engines, assessments: store.assessments, predictions: store.predictions, maintenance: store.maintenance, request: body, planId });
+    store.addPlan(plan);
+    store.log('maintenance_allocation_created', 'system', { planId, clientRequestId: body.clientRequestId ?? null, selected: plan.entries.length, excluded: plan.exclusions.length });
+    await store.persist();
+    return reply.code(201).send({ reused: false, plan });
+  });
   app.get('/api/engines/:id/risk-events', async request => { const id = (request.params as { id: string }).id; return store.assessments.filter(item => item.engineId === id).flatMap(item => item.anomalies); });
   app.get('/api/audit/:engineId', async request => store.audit.filter(item => item.engineId === (request.params as { engineId: string }).engineId));
   app.setErrorHandler((error: Error, _request, reply) => reply.code((error as Error & { statusCode?: number }).statusCode ?? 500).send({ error: error.message }));

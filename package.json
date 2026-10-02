@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo": "tsx src/cli.ts demo"
+    "demo": "tsx src/cli.ts demo",
+    "allocation-demo": "tsx src/cli.ts allocation-demo"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",
